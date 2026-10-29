@@ -1,0 +1,29 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+# Go modules are published by the tag itself (proxy.golang.org); the release carries an attested source zip.
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go vet ./... && go test ./...
+      - name: Source archive
+        run: git archive --format=zip --prefix="watchtower-go-${GITHUB_REF_NAME}/" -o "watchtower-go-${GITHUB_REF_NAME}.zip" HEAD
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'watchtower-go-*.zip'
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" watchtower-go-*.zip --generate-notes --verify-tag
