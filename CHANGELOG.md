@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Metrics are on by default (`Signals` zero now means traces, metrics and logs), with delta temporality for counters and histograms. `WATCHTOWER_LOGS` / `WATCHTOWER_METRICS=off` (or `OTEL_*_EXPORTER=none`) drop a signal from the default set.
+
 ## 0.1.0
 
 - Initial release, extended from the internal `wtotel` package.

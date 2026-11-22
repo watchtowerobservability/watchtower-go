@@ -3,6 +3,7 @@ package watchtower
 import (
 	"context"
 	"log/slog"
+	"runtime"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 )
@@ -14,12 +15,29 @@ import (
 //
 //	slog.SetDefault(slog.New(watchtower.SlogHandler(slog.NewTextHandler(os.Stderr, nil))))
 func SlogHandler(next slog.Handler) slog.Handler {
-	h := otelslog.NewHandler("github.com/watchtowerobservability/watchtower-go")
+	h := withSource{otelslog.NewHandler("github.com/watchtowerobservability/watchtower-go")}
 	if next == nil {
 		return h
 	}
 	return fanout{h, next}
 }
+
+// withSource stamps the caller's file and line (record PC) as the OTel code.* attributes.
+type withSource struct{ slog.Handler }
+
+func (w withSource) Handle(ctx context.Context, r slog.Record) error {
+	if r.PC != 0 {
+		f, _ := runtime.CallersFrames([]uintptr{r.PC}).Next()
+		if f.File != "" {
+			r = r.Clone()
+			r.AddAttrs(slog.String("code.filepath", f.File), slog.Int("code.lineno", f.Line))
+		}
+	}
+	return w.Handler.Handle(ctx, r)
+}
+
+func (w withSource) WithAttrs(a []slog.Attr) slog.Handler { return withSource{w.Handler.WithAttrs(a)} }
+func (w withSource) WithGroup(n string) slog.Handler      { return withSource{w.Handler.WithGroup(n)} }
 
 type fanout [2]slog.Handler
 
@@ -39,5 +57,7 @@ func (f fanout) Handle(ctx context.Context, r slog.Record) error {
 	return first
 }
 
-func (f fanout) WithAttrs(a []slog.Attr) slog.Handler { return fanout{f[0].WithAttrs(a), f[1].WithAttrs(a)} }
-func (f fanout) WithGroup(n string) slog.Handler      { return fanout{f[0].WithGroup(n), f[1].WithGroup(n)} }
+func (f fanout) WithAttrs(a []slog.Attr) slog.Handler {
+	return fanout{f[0].WithAttrs(a), f[1].WithAttrs(a)}
+}
+func (f fanout) WithGroup(n string) slog.Handler { return fanout{f[0].WithGroup(n), f[1].WithGroup(n)} }

@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -17,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
@@ -60,13 +63,23 @@ func Init(ctx context.Context, opt Options) (func(context.Context) error, error)
 		if err != nil {
 			return fail(err)
 		}
-		tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exp), sdktrace.WithResource(res))
+		topts := []sdktrace.TracerProviderOption{sdktrace.WithBatcher(exp), sdktrace.WithResource(res)}
+		if opt.RemoteSampling {
+			rs := NewRemoteSampler(opt.Endpoint, opt.IngestKey, opt.ServiceName, opt.Environment, opt.SamplingInterval)
+			topts = append(topts, sdktrace.WithSampler(sdktrace.ParentBased(rs)))
+			shutdowns = append(shutdowns, func(context.Context) error { rs.Stop(); return nil })
+		}
+		if opt.CodeOrigin {
+			topts = append(topts, sdktrace.WithSpanProcessor(codeOrigin{}))
+		}
+		tp := sdktrace.NewTracerProvider(topts...)
 		otel.SetTracerProvider(tp)
 		shutdowns = append(shutdowns, tp.Shutdown)
 	}
 	if opt.Signals&Metrics != 0 {
 		exp, err := otlpmetrichttp.New(ctx, otlpmetrichttp.WithEndpointURL(opt.Endpoint+"/v1/metrics"), otlpmetrichttp.WithHeaders(hdr),
-			otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression), otlpmetrichttp.WithHTTPClient(client))
+			otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression), otlpmetrichttp.WithHTTPClient(client),
+			otlpmetrichttp.WithTemporalitySelector(temporality(os.Getenv("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"))))
 		if err != nil {
 			return fail(err)
 		}
@@ -87,7 +100,25 @@ func Init(ctx context.Context, opt Options) (func(context.Context) error, error)
 	if w != nil { // closed last: the providers' final flush may still append
 		shutdowns = append(shutdowns, func(context.Context) error { return w.Close() })
 	}
+	if opt.CaptureRules {
+		go LoadCaptureRules(context.WithoutCancel(ctx), &http.Client{Timeout: 10 * time.Second}, opt.APIURL, opt.IngestKey, opt.ServiceName)
+	}
 	return func(ctx context.Context) error { return runAll(ctx, shutdowns) }, nil
+}
+
+// temporality is the OTel "delta" preference (our ingest default) for counters and histograms;
+// up-down counters and gauges stay cumulative. pref=cumulative keeps the SDK default.
+func temporality(pref string) sdkmetric.TemporalitySelector {
+	if strings.EqualFold(strings.TrimSpace(pref), "cumulative") {
+		return sdkmetric.DefaultTemporalitySelector
+	}
+	return func(k sdkmetric.InstrumentKind) metricdata.Temporality {
+		switch k {
+		case sdkmetric.InstrumentKindCounter, sdkmetric.InstrumentKindHistogram, sdkmetric.InstrumentKindObservableCounter:
+			return metricdata.DeltaTemporality
+		}
+		return metricdata.CumulativeTemporality
+	}
 }
 
 func runAll(ctx context.Context, fns []func(context.Context) error) error {

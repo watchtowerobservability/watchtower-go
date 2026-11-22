@@ -3,6 +3,7 @@ package watchtower
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,7 @@ type fakeGateway struct {
 	ok   int // requests answered 200
 	auth []string
 	path []string
+	body [][]byte // as sent (gzip)
 }
 
 func newGateway(t *testing.T) *fakeGateway {
@@ -35,7 +37,9 @@ func newGateway(t *testing.T) *fakeGateway {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		b, _ := io.ReadAll(r.Body)
 		g.mu.Lock()
+		g.body = append(g.body, b)
 		g.ok++
 		g.auth = append(g.auth, r.Header.Get("Authorization"))
 		g.path = append(g.path, r.URL.Path)
@@ -59,7 +63,7 @@ func emit(name string) {
 
 func TestInitSendsTracesWithBearerKey(t *testing.T) {
 	g := newGateway(t)
-	shutdown, err := Init(context.Background(), Options{Endpoint: g.URL, IngestKey: "wti_test", ServiceName: "svc", Environment: "test"})
+	shutdown, err := Init(context.Background(), Options{Endpoint: g.URL, IngestKey: "wti_test", ServiceName: "svc", Environment: "test", Signals: Traces | Logs})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +101,7 @@ func TestDefaultEndpoint(t *testing.T) {
 
 func TestOfflineBufferReplaysAfterRecovery(t *testing.T) {
 	g := newGateway(t)
-	opt := Options{Endpoint: g.URL, IngestKey: "wti_test", ServiceName: "svc", BufferDir: t.TempDir()}
+	opt := Options{Endpoint: g.URL, IngestKey: "wti_test", ServiceName: "svc", BufferDir: t.TempDir(), Signals: Traces | Logs}
 
 	g.down.Store(true)
 	shutdown, err := Init(context.Background(), opt)

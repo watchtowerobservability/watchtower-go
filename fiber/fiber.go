@@ -1,5 +1,5 @@
 // Package wtfiber instruments Fiber v2: server spans with W3C context extraction, panic and
-// handler error capture.
+// handler error capture, and payload capture per the capture rules.
 package wtfiber
 
 import (
@@ -45,9 +45,13 @@ func Middleware() fiber.Handler {
 			if err != nil && !panicked && status >= http.StatusInternalServerError {
 				watchtower.CaptureError(ctx, err)
 			}
-			if p := c.Route().Path; p != "" {
-				span.SetName(c.Method() + " " + p)
-				span.SetAttributes(attribute.String("http.route", p))
+			route := c.Route().Path
+			if route != "" {
+				span.SetName(c.Method() + " " + route)
+				span.SetAttributes(attribute.String("http.route", route))
+			}
+			if watchtower.CaptureActive() {
+				capturePayload(c, span, route)
 			}
 			span.SetAttributes(attribute.Int("http.response.status_code", status))
 			if status >= http.StatusInternalServerError {
@@ -57,3 +61,22 @@ func Middleware() fiber.Handler {
 		return c.Next()
 	}
 }
+
+// capturePayload records the bodies per the rule matching route. A streamed body is skipped:
+// reading it here would consume it.
+func capturePayload(c *fiber.Ctx, span trace.Span, route string) {
+	if route == "" {
+		route = c.Path()
+	}
+	var req, res []byte
+	if !c.Request().IsBodyStream() {
+		req = head(c.Body())
+	}
+	if !c.Response().IsBodyStream() {
+		res = head(c.Response().Body())
+	}
+	watchtower.CapturePayload(span, route, string(c.Request().Header.ContentType()), req,
+		string(c.Response().Header.ContentType()), res)
+}
+
+func head(b []byte) []byte { return b[:min(len(b), 2*watchtower.PayloadMax)] }

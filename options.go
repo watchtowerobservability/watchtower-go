@@ -4,7 +4,9 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -32,7 +34,9 @@ type Options struct {
 	Environment string // deployment.environment.name
 	// Attributes are extra resource attributes; any key under the reserved "wt." namespace is dropped.
 	Attributes []attribute.KeyValue
-	Signals    Signal // zero means Traces|Logs
+	// Signals zero means Traces|Metrics|Logs, minus Logs when WATCHTOWER_LOGS=off (or
+	// OTEL_LOGS_EXPORTER=none) and minus Metrics when WATCHTOWER_METRICS=off (or OTEL_METRICS_EXPORTER=none).
+	Signals Signal
 	// BufferDir enables the offline buffer: failed exports are written there and replayed
 	// oldest first after the gateway answers again (at-least-once).
 	BufferDir      string
@@ -40,6 +44,20 @@ type Options struct {
 	// Redact, when set, is called for every captured error message and string attribute and
 	// returns the value to send (return "" to drop the content).
 	Redact func(key, value string) string
+	// CaptureRules fetches the service's payload capture rules (APM-016) from APIURL at Init and
+	// records request/response bodies and GraphQL operations where a rule matches the route
+	// (wtnethttp.Handler). Also on with WT_CAPTURE_RULES=1.
+	CaptureRules bool
+	APIURL       string // edge base URL for capture rules; WT_API_URL, else Endpoint
+	// RemoteSampling applies the project's head sampling rules in the process, polled from
+	// /v1/sampling every SamplingInterval (default 30 s, WT_SAMPLING_INTERVAL_S); the last good
+	// config stays in force when a poll fails. Also on with WT_REMOTE_SAMPLING=1. Spans dropped
+	// here never reach the gateway, so its exact request counts see only what is kept.
+	RemoteSampling bool
+	// CodeOrigin stamps code.filepath, code.lineno and code.function on every span (the code that
+	// started it), so traces link to the repo. Also on with WT_CODE_ORIGIN=1.
+	CodeOrigin       bool
+	SamplingInterval time.Duration
 }
 
 // String never shows the ingest key.
@@ -84,10 +102,39 @@ func (o Options) resolve() (Options, error) {
 	case o.ServiceName == "":
 		return o, errors.New("watchtower: ServiceName (WT_SERVICE) is required")
 	}
+	fromEnv(&o.APIURL, "WT_API_URL")
+	if o.APIURL == "" {
+		o.APIURL = o.Endpoint
+	}
+	o.APIURL = strings.TrimRight(o.APIURL, "/")
+	o.CaptureRules = o.CaptureRules || os.Getenv("WT_CAPTURE_RULES") == "1"
+	o.RemoteSampling = o.RemoteSampling || os.Getenv("WT_REMOTE_SAMPLING") == "1"
+	o.CodeOrigin = o.CodeOrigin || os.Getenv("WT_CODE_ORIGIN") == "1"
+	if s, err := strconv.Atoi(os.Getenv("WT_SAMPLING_INTERVAL_S")); o.SamplingInterval == 0 && err == nil && s > 0 {
+		o.SamplingInterval = time.Duration(s) * time.Second
+	}
 	if o.Signals == 0 {
-		o.Signals = Traces | Logs
+		o.Signals = Traces
+		if switchOn("WATCHTOWER_METRICS", "OTEL_METRICS_EXPORTER") {
+			o.Signals |= Metrics
+		}
+		if switchOn("WATCHTOWER_LOGS", "OTEL_LOGS_EXPORTER") {
+			o.Signals |= Logs
+		}
 	}
 	return o, nil
+}
+
+// switchOn reads a WATCHTOWER_* switch (on unless off/false/0/no); otelExporter=none also turns it off.
+func switchOn(env, otelExporter string) bool {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(otelExporter)), "none") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(env))) {
+	case "off", "false", "0", "no":
+		return false
+	}
+	return true
 }
 
 // safeAttrs drops attributes in the reserved wt.* namespace (the gateway deletes them anyway).
